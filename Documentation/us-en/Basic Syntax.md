@@ -103,21 +103,23 @@ num = 15; // ValueException: Error
 
 ### Syntax:
  - Basic: `foreach (T name, ... ; name in Item, ...) { /* Code */ }`
+ - Recommended in 1.7.0: `foreach (T? name, ... ; name in Item, ...) { /* Code */ }`
 
-### Clever Use
+### Clever Uses
  - Iterates simultaneously, driven by the longest data; very useful in data processing.
  - Combined with the standard library's `range` function, it can replace `for`.
 
 ### Notes:
  - Driven by the longest; shorter ones are replaced with `null`. You can use `name is null`, `name == null`.
+ - In 1.7.0's `foreach`, variables should be defined as nullable types; otherwise, a warning is emitted, and values beyond the length are no longer `null` but the default value (e.g., `0` / `""`).
 
 
-### Example Code:
+### Example Code (1.7.0):
 1. Simple counting:
 ```vox
 using Code;
 
-foreach (int i; i in range(10)) { Debug.log(i); }
+foreach (int? i; i in range(10)) { Debug.log(i); }
 
 /*
 Output:
@@ -137,7 +139,7 @@ Output:
 ```vox
 using Code;
 
-foreach (int i, j; i in range(10), j in range(1, 11)) {
+foreach (int? i, j; i in range(10), j in range(1, 11)) {
     Debug.log(j, i, sep="\t");
 }
 
@@ -159,7 +161,7 @@ Output:
 ```vox
 using Code;
 
-foreach (int i, j; i in range(10), j in range(15)) {
+foreach (int? i, j; i in range(10), j in range(15)) {
     Debug.log(j, i);
 }
 
@@ -186,7 +188,7 @@ Output:
 ```vox
 using Code;
 
-foreach (int i, j; i in range(10), j in range(15)) {
+foreach (int? i, j; i in range(10), j in range(15)) {
     Debug.log(j, i is null ? "?" : i); // You can also use i == null
 }
 
@@ -225,7 +227,7 @@ Output:
  - If it's just a temporary function, there's no need to write an extra function and consume memory.
 
 ### Notes:
- - May trigger UB.
+ - May trigger UB (versions 1.6.0 and above no longer trigger UB!)
 
 ### Example Code
 1. Using a variable as a function:

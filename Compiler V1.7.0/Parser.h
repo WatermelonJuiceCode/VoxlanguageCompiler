@@ -1676,6 +1676,14 @@ private:
             }
             return;
         }
+        // ★ 注册枚举的命名空间
+        if (auto en = std::dynamic_pointer_cast<EnumNode>(node)){
+            _knownEnums.insert(en->name);
+            if (!nsPrefix.empty() && !_classToNamespace.count(en->name)){
+                _classToNamespace[en->name] = nsPrefix;
+            }
+            return;
+        }
         if (auto ns = std::dynamic_pointer_cast<NamespaceNode>(node)){
             std::string newPrefix = nsPrefix.empty()
                                   ? ns->name
@@ -1817,6 +1825,7 @@ private:
         subParser._knownClasses       = _knownClasses;
         subParser._knownInterfaces    = _knownInterfaces;
         subParser._knownEnums         = _knownEnums;
+        subParser._knownEnumMembers   = _knownEnumMembers;   // ★ 继承枚举短名
         subParser._knownExceptions    = _knownExceptions;
         subParser._knownNamespaces    = _knownNamespaces;
         subParser._classToNamespace   = _classToNamespace;
@@ -1865,11 +1874,6 @@ private:
                         ns->add(stmt);
                     }
                 } else {
-                    // ★ 变量进了 namespace 就不再是"顶层全局"了 ——
-                    //   清掉 isGlobal，否则 toC() 会把它改名成 vox_g_xxx，
-                    if (auto var = std::dynamic_pointer_cast<VariableDeclNode>(stmt)){
-                        var->isGlobal = false;
-                    }
                     ns->add(stmt);
                 }
             }
@@ -1901,6 +1905,7 @@ private:
         for (const auto& c : subParser._knownClasses)        _knownClasses.insert(c);
         for (const auto& c : subParser._knownInterfaces)     _knownInterfaces.insert(c);
         for (const auto& c : subParser._knownEnums)          _knownEnums.insert(c);
+        for (const auto& kv : subParser._knownEnumMembers)   _knownEnumMembers.insert(kv);
         for (const auto& c : subParser._knownExceptions)     _knownExceptions.insert(c);
         for (const auto& c : subParser._knownNamespaces)     _knownNamespaces.insert(c);
         for (const auto& c : subParser._externFunctions)     _externFunctions.insert(c);
@@ -3128,7 +3133,13 @@ private:
         // 1) 声明列表：支持两种写法
         //    a) 每个变量带类型：  int i, string j
         //    b) 共享类型：        int i, j, k
-        std::vector<std::pair<std::string,std::string>> decls;
+        struct DeclInfo {
+            std::string type;
+            std::string name;
+            int line;
+            int col;
+        };
+        std::vector<DeclInfo> decls;
         std::string lastType;
         do {
             std::string type;
@@ -3149,7 +3160,7 @@ private:
                 raise(EX_SYNTAX, "Expected variable name in foreach declaration", current().line);
             }
             Token nameTok = advance();
-            decls.push_back({type, nameTok.value});
+            decls.push_back({type, nameTok.value, nameTok.line, nameTok.col});
             lastType = type;
         } while (match(TokenType::Comma));
 
@@ -3174,8 +3185,8 @@ private:
             std::string type;
             bool found = false;
             for (const auto& d : decls){
-                if (d.second == name){
-                    type = d.first;
+                if (d.name == name){
+                    type = d.type;
                     found = true;
                     break;
                 }
@@ -3187,15 +3198,49 @@ private:
             vars.push_back({type, name, iterable});
         } while (match(TokenType::Comma));
 
+        // ★ 检查是否所有声明的变量都有对应的 in 子句
+        for (const auto& d : decls) {
+            bool found = false;
+            for (const auto& v : vars) {
+                if (v.name == d.name) { found = true; break; }
+            }
+            if (!found) {
+                // ★ 用 throw CompileError 替代 raise，精准传入声明时的 line 和 col
+                throw CompileError(EX_NAME, 
+                    "variable '" + d.name + "' declared in foreach but has no 'in' clause",
+                    _fileName, getLine(d.line), d.line, d.col, (int)d.name.size(), "");
+            }
+        }
+
+        // ★ 多变量 foreach 可空性警告
+        if (vars.size() > 1) {
+            for (const auto& v : vars) {
+                bool isNullable = false;
+                if (!v.type.empty()) {
+                    if (v.type.back() == '?') isNullable = true;
+                    else if (v.type == "any") isNullable = true;
+                }
+                if (!isNullable) {
+                    int ln = 0;
+                    for (const auto& d : decls) {
+                        if (d.name == v.name) { ln = d.line; break; }
+                    }
+                    warn(ln, "multi-variable 'foreach' variable '" + v.name + "' has non-nullable type '" + v.type + "'. When the iterable is shorter than others, it will hold the default value (0 / \"\") instead of null. Use '" + v.type + "?' if you need null.");
+                }
+            }
+        }
+
         eat(TokenType::RParen);
         eat(TokenType::LBrace);
 
-        // ★ 多变量时登记 optional 变量名
+        // ★ 多变量时登记 optional 变量名 —— 只有 T? 类型才需要 deref
         std::vector<std::string> addedOptional;
         if (vars.size() > 1){
             for (const auto& v : vars){
-                if (_optionalLoopVars.insert(v.name).second){
-                    addedOptional.push_back(v.name);
+                if (!v.type.empty() && v.type.back() == '?'){
+                    if (_optionalLoopVars.insert(v.name).second){
+                        addedOptional.push_back(v.name);
+                    }
                 }
             }
         }
@@ -3682,7 +3727,7 @@ private:
         while (check(TokenType::Less) || check(TokenType::Greater) ||
                check(TokenType::LessEqual) || check(TokenType::GreaterEqual) ||
                check(TokenType::EqualEqual) || check(TokenType::NotEqual) ||
-               check(TokenType::KwIs)){
+               check(TokenType::KwIs) || check(TokenType::KwIn)){
             int opLine = current().line;
             TokenType op = advance().type;
 
@@ -3756,6 +3801,10 @@ private:
         _knownEnums.insert(name);
         for (const auto& m : members){
             _knownEnumMembers[name + "." + m.name] = name;
+            // ★ 短名映射：只在不冲突时注册
+            if (_knownEnumMembers.find(m.name) == _knownEnumMembers.end()){
+                _knownEnumMembers[m.name] = name;
+            }
         }
 
         return std::make_shared<EnumNode>(name, members);
@@ -3807,8 +3856,9 @@ private:
     }
 
     // ★ 创建 VariableNode：多变量 foreach 变量自动设 needsDeref
-    std::shared_ptr<VariableNode> makeVariableNode(const std::string& name, int line){
+    std::shared_ptr<VariableNode> makeVariableNode(const std::string& name, int line, int col = 0){
         auto v = std::make_shared<VariableNode>(name, line);
+        v->col = col;
         if (_optionalLoopVars.count(name)){
             v->needsDeref = true;
             v->isOptionalLoopVar = true;
@@ -4068,12 +4118,36 @@ private:
                         nsAccess = true;
                     }
                 }
+                // ★ 如果是 namespace.MEMBER 且 MEMBER 是某个 enum 的短名，
+                //   升级为 namespace.EnumName.MEMBER
+                if (nsAccess){
+                    // ★ 先检查 node 是不是已经是枚举名，避免 Enum.Enum.Member
+                    bool nodeIsEnum = false;
+                    if (auto v = std::dynamic_pointer_cast<VariableNode>(node)) {
+                        if (_knownEnums.count(v->name)) nodeIsEnum = true;
+                    }
+                    auto eit = _knownEnumMembers.find(memberTok.value);
+                    if (!nodeIsEnum && eit != _knownEnumMembers.end()){
+                        std::string enumName = eit->second;
+                        // 只有不带 '.' 的短名才升级
+                        if (enumName.find('.') == std::string::npos){
+                            auto inner = std::make_shared<MemberAccessNode>(
+                                node, enumName, true, memberTok.line, memberTok.col);
+                            node = std::make_shared<MemberAccessNode>(
+                                inner, memberTok.value, false,
+                                memberTok.line, memberTok.col);
+                            continue;
+                        }
+                    }
+                }
+
                 node = std::make_shared<MemberAccessNode>(node, memberTok.value, nsAccess, memberTok.line, memberTok.col);
             } else if (match(TokenType::LBracket)){
                 int ln = current().line;
+                int col = current().col;   // ★ 记录 [ 之后的第一个字符列号（即索引表达式的起始位置）
                 AstNodePtr index = parseExpression();
                 eat(TokenType::RBracket);
-                node = std::make_shared<IndexNode>(node, index, ln);
+                node = std::make_shared<IndexNode>(node, index, ln, col); // ★ 传入 col
             } else if (check(TokenType::PlusPlus) || check(TokenType::SubSub)){
                 // ★ 后置自增/自减（只吃一次：不允许 i++++）
                 int opLine = current().line;
@@ -4113,6 +4187,19 @@ private:
                 && isLambdaAhead()){
                 return parseLambda();
             }
+            // ★ 检查是否是某个已知枚举的成员短名
+            auto eit = _knownEnumMembers.find(token.value);
+            if (eit != _knownEnumMembers.end() && eit->second.find('.') == std::string::npos) {
+                std::string enumShort = eit->second;
+                std::string enumFull = enumShort;
+                auto cit = _classToNamespace.find(enumShort);
+                if (cit != _classToNamespace.end() && !cit->second.empty()) {
+                    enumFull = cit->second + "::" + enumShort;
+                }
+                advance();
+                auto enumVar = std::make_shared<VariableNode>(enumFull, token.line, token.col);
+                return std::make_shared<MemberAccessNode>(enumVar, token.value, true, token.line, token.col);
+            }
             advance();
             if (token.value == "self"){
                 auto sn = std::make_shared<SelfNode>();
@@ -4138,7 +4225,7 @@ private:
                 }
                 return std::make_shared<SuperNode>(base);
             }
-            return makeVariableNode(token.value, token.line);
+            return makeVariableNode(token.value, token.line, token.col);
         }
         if (token.type == TokenType::KwSelf){
             advance();
@@ -4307,17 +4394,26 @@ private:
         }
 
         if (token.type == TokenType::LParen){
-            std::size_t i = 1;
-            if (_pos + i < _tokens.size() && isTypeKeyword(_tokens[_pos + i].type)){
-                if (_pos + i + 1 < _tokens.size() &&
-                    _tokens[_pos + i + 1].type == TokenType::RParen){
-                    int ln = current().line;
-                    advance();
-                    std::string targetType = advance().value;
-                    eat(TokenType::RParen);
-                    AstNodePtr expr = parsePostfix(parsePrimary());
-                    return std::make_shared<CastNode>(targetType, expr, nullptr, ln);
+            // ★ 改进：支持 (int?) / (List<int>?) 等可空类型转换
+            std::size_t save = _pos;
+            advance(); // (
+            bool isCast = false;
+            std::string targetType;
+            if (isTypeKeyword(current().type) || isContainerStart(current().type) || check(TokenType::Identifier)) {
+                std::size_t typeSave = _pos;
+                targetType = parseTypeName();
+                if (check(TokenType::RParen)) {
+                    isCast = true;
+                } else {
+                    _pos = typeSave; // 不是类型，回滚
                 }
+            }
+            if (isCast) {
+                eat(TokenType::RParen);
+                AstNodePtr expr = parsePostfix(parsePrimary());
+                return std::make_shared<CastNode>(targetType, expr, nullptr, token.line);
+            } else {
+                _pos = save; // 回滚到 '('
             }
 
             advance();   // 吃 (
@@ -4678,6 +4774,15 @@ private:
 
         if (check(TokenType::LParen)){
             if (isConst) raise(EX_TYPE, "Function cannot be const", nameTok.line);
+            
+            // ★★★ 核心修复：拦截手写的 main，并附带 hint ★★★
+            if (name == "main") {
+                raise(EX_NAME, 
+                      "'main' is a reserved entry point in Vox. Top-level statements are executed automatically.\n"
+                      "  (hint: put your code at the top level, or rename it to 'start()')", 
+                      nameTok.line, nameTok.col, "cannot define 'main' here");
+            }
+            
             return parseFunctionDeclaration(typeName, name);
         }
         return parseVariableDeclaration(typeName, name, isConst);
@@ -6351,6 +6456,22 @@ private:
             propagateListLiteralType(finalArgs[i], exp);
         }
 
+        // ★ 对 any 参数，如果是 optional 循环变量，不解包（保留 null 语义）
+        for (std::size_t i = 0; i < finalArgs.size(); ++i) {
+            bool isAny = false;
+            if (i < params.size()) {
+                if (params[i].type == "any") isAny = true;
+                if (params[i].isVariadic) isAny = true;
+            } else if (!params.empty() && params.back().isVariadic) {
+                isAny = true;
+            }
+            if (isAny) {
+                if (auto v = std::dynamic_pointer_cast<VariableNode>(finalArgs[i])) {
+                    if (v->isOptionalLoopVar) v->forceNoDeref = true;
+                }
+            }
+        }
+
         call.args = finalArgs;
         call.autoBoxArgs.assign(finalArgs.size(), false); // 重新对齐标记大小
     }
@@ -7040,11 +7161,14 @@ private:
     void checkConstantIndexOutOfRange(IndexNode& n){
         if (auto ll = std::dynamic_pointer_cast<ListLiteralNode>(n.object)){
             if (auto num = std::dynamic_pointer_cast<NumberNode>(n.index)){
-                if (num->value < 0 || num->value >= (int64_t)ll->items.size()){
+                int64_t len = (int64_t)ll->items.size();
+                int64_t idx = num->value;
+                // ★ 允许 -len 到 len-1
+                if (idx < -len || idx >= len) {
                     raise(EX_INDEX_OUT,
-                          "index " + std::to_string(num->value)
+                          "index " + std::to_string(idx)
                           + " out of range for list of size "
-                          + std::to_string(ll->items.size()),
+                          + std::to_string(len),
                           n.line);
                 }
             }
@@ -7873,19 +7997,23 @@ private:
                 if (!suggestion.empty()) {
                     msg += "\n  (hint: did you mean '" + suggestion + "'?)";
                 }
-                raise(EX_NAME, msg, v->line);
+                int len = nm.empty() ? 1 : (int)nm.size();
+                throw CompileError(EX_NAME, msg, _fileName, getLine(v->line), v->line, v->col, len, "");
             }
             _varUsed.insert(nm);   // ★ 与 _varDeclLine 里的原始名一致
             
             // ★ 顶层变量 → 加前缀（只加一次）
             //   子 Parser 的变量会被内联进 namespace，绝不能带 vox_g_ 前缀
-            if (!hadPrefix && _isTopLevel){
+            if (!hadPrefix && _isTopLevel && _nsDepth == 0){
                 bool isLocal = false;
                 for (std::size_t i = 1; i < _typeScopeStack.size(); ++i){
                     if (_typeScopeStack[i].count(nm)){ isLocal = true; break; }
                 }
-                if (!isLocal && _globalVarNames.count(nm) > 0){
-                    v->name = "vox_g_" + nm;   // ✅ 正确重命名
+                // ★ 只对主模块顶层作用域的变量加前缀
+                bool isTopLevelVar = !_typeScopeStack.empty()
+                                   && _typeScopeStack[0].count(nm) > 0;
+                if (!isLocal && isTopLevelVar && _globalVarNames.count(nm) > 0){
+                    v->name = "vox_g_" + nm;
                 }
             }
 
@@ -8037,8 +8165,50 @@ private:
                 typeCheckExpr(a);
             }
 
+            // ★★★ 递归扒开 CastNode，只要最底层是 optional 循环变量，就强行保留 optional 状态 ★★★
+            {
+                std::function<void(const AstNodePtr&)> forceKeepOpt = [&](const AstNodePtr& node) {
+                    if (!node) return;
+                    if (auto v = std::dynamic_pointer_cast<VariableNode>(node)) {
+                        if (v->isOptionalLoopVar) v->forceNoDeref = true;
+                    } else if (auto c = std::dynamic_pointer_cast<CastNode>(node)) {
+                        forceKeepOpt(c->expr);
+                    } else if (auto r = std::dynamic_pointer_cast<RefArgNode>(node)) {
+                        forceKeepOpt(r->target);
+                    }
+                };
+                for (const auto& a : n->args) {
+                    forceKeepOpt(a);
+                }
+            }
+
             // ★★★ 核心：在这里再次尝试 resolveCallParams，此时作用域类型已就绪 ★★★
             resolveCallParams(*n);
+
+            // ★ 对所有 any 参数，如果是多变量 foreach 的 optional 变量，强行保留 optional 状态
+            {
+                std::string fnName = callCalleeName(n->callee);
+                const std::vector<std::vector<Param>>* sigsPtr = findSignatureList(fnName);
+                if (sigsPtr && !sigsPtr->empty()) {
+                    for (const auto& sig : *sigsPtr) {
+                        for (std::size_t i = 0; i < n->args.size(); ++i) {
+                            bool isAny = false;
+                            if (i < sig.size()) {
+                                if (sig[i].type == "any" || sig[i].isVariadic) isAny = true;
+                            } else if (!sig.empty() && sig.back().isVariadic) {
+                                isAny = true;
+                            }
+                            if (isAny) {
+                                if (auto v = std::dynamic_pointer_cast<VariableNode>(n->args[i])) {
+                                    if (v->isOptionalLoopVar) {
+                                        v->forceNoDeref = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // ★ 兜底：resolveCallParams 跑完后不应该残留 NamedArgNode
             for (const auto& a : n->args){
@@ -8293,6 +8463,20 @@ private:
 
             std::string lt = inferExprType(n->left);
             std::string rt = inferExprType(n->right);
+
+            // ★★★ 核心修复：参与二元运算的 optional 变量必须解包，否则 C++ 编译报错 ★★★
+            if (!lt.empty() && lt.back() == '?' && n->op != TokenType::EqualEqual && n->op != TokenType::NotEqual) {
+                if (auto v = std::dynamic_pointer_cast<VariableNode>(n->left)) {
+                    v->needsDeref = true;
+                    v->forceNoDeref = false;  // 强行解包
+                }
+            }
+            if (!rt.empty() && rt.back() == '?' && n->op != TokenType::EqualEqual && n->op != TokenType::NotEqual) {
+                if (auto v = std::dynamic_pointer_cast<VariableNode>(n->right)) {
+                    v->needsDeref = true;
+                    v->forceNoDeref = false;
+                }
+            }
             
             // ★ 确保这里有 isStringConcat 的判断
             if (n->op == TokenType::Plus){
@@ -8323,6 +8507,30 @@ private:
             typeCheckExpr(n->object);
             typeCheckExpr(n->index);
             checkConstantIndexOutOfRange(*n);
+
+            // ★★★ 检查 Dict 和 List 的键/索引类型 ★★★
+            std::string objType = inferExprType(n->object);
+            if (objType.rfind("Dict<", 0) == 0) {
+                auto parts = extractTypeArgs(objType);
+                if (parts.size() == 2) {
+                    std::string expectedKey = parts[0];
+                    std::string actualKey = inferExprType(n->index);
+                    if (!typeCompatible(actualKey, expectedKey)) {
+                        // ★ 传入列号，长度默认 1（可以精准指在引号上）
+                        throw CompileError(EX_TYPE, 
+                            "dict key must be '" + expectedKey + "', not '" + actualKey + "'", 
+                            _fileName, getLine(n->line), n->line, n->col, 1);
+                    }
+                }
+            } else if (objType.rfind("List<", 0) == 0 || objType.rfind("FinalList<", 0) == 0) {
+                std::string actualIndex = inferExprType(n->index);
+                if (!isIntegerType(actualIndex) && actualIndex != "?") {
+                    // ★ 传入列号，长度默认 1
+                    throw CompileError(EX_TYPE, 
+                        "list index must be an integer, not '" + actualIndex + "'", 
+                        _fileName, getLine(n->line), n->line, n->col, 1);
+                }
+            }
             return;
         }
 
@@ -8621,6 +8829,11 @@ private:
         // ================= VariableDeclNode =================
         if (auto n = std::dynamic_pointer_cast<VariableDeclNode>(node)){
             
+            // ★ 非顶层模块或处于命名空间内，强制取消全局标记，不加 vox_g_ 前缀
+            if (!_isTopLevel || _nsDepth > 0) {
+                n->isGlobal = false;
+            }
+
             // ★★★ 核心修复：编译期拦截未定义类型 / 未通过 .* 导入的类 ★★★
             std::string typeToCheck = n->typeName;
             
@@ -9337,7 +9550,18 @@ private:
             _typeScopeStack.push_back({});
             _constScopeStack.push_back({});
             for (const auto& v : n->vars){
-                if (v.iterable) typeCheckExpr(v.iterable);
+                if (v.iterable) {
+                    // ★★★ 核心：把 foreach 变量的类型传播给后面的列表字面量 ★★★
+                    std::string itemType = v.type;
+                    if (!itemType.empty() && itemType.back() == '?') {
+                        itemType = itemType.substr(0, itemType.size() - 1); // 去问号推导
+                    }
+                    if (!itemType.empty() && itemType != "?") {
+                        propagateListLiteralType(v.iterable, "List<" + itemType + ">");
+                    }
+                    
+                    typeCheckExpr(v.iterable);
+                }
                 _typeScopeStack.back()[v.name] = v.type;
             }
             _semLoopDepth++;                                // ★
@@ -9492,10 +9716,23 @@ private:
                 n->isAnyTarget = true;
             }
 
-            if (!n->name.empty() && isConstVar(n->name)){
-                raise(EX_VALUE,
-                    "cannot assign to const variable '" + n->name + "'",
-                    n->line);
+            if (!n->name.empty()) {
+                std::string nm = n->name;
+                static const std::string voxPrefix = "vox_g_";
+                if (nm.size() > voxPrefix.size() &&
+                    nm.compare(0, voxPrefix.size(), voxPrefix) == 0) {
+                    nm = nm.substr(voxPrefix.size());
+                }
+                if (isConstVar(nm)) {
+                    // ★ 尝试通过搜索整行来定位变量名的位置
+                    std::string lineStr = getLine(n->line);
+                    int col = (int)lineStr.find(nm);
+                    if (col < 0) col = current().col; // 兜底
+                    
+                    raise(EX_VALUE,
+                        "cannot assign to const variable '" + nm + "'",
+                        n->line, col, "cannot assign to const variable");
+                }
             }
             return;
         }

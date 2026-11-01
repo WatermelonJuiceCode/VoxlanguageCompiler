@@ -248,18 +248,30 @@ static std::string readFileText(const fs::path& p){
     return ss.str();
 }
 
-static int run_process(const std::string& cmd) {
+static int run_process(const std::string& cmd, const fs::path& workingDir = fs::path()) {
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, NULL, 0);
     if (wlen <= 0) return -1;
     std::wstring wcmd(wlen, 0);
     MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wcmd[0], wlen);
 
+    std::wstring wdir;
+    if (!workingDir.empty()) {
+        std::string d = workingDir.u8string();
+        int wdlen = MultiByteToWideChar(CP_UTF8, 0, d.c_str(), -1, NULL, 0);
+        if (wdlen > 0) {
+            wdir.resize(wdlen);
+            MultiByteToWideChar(CP_UTF8, 0, d.c_str(), -1, &wdir[0], wdlen);
+            if (!wdir.empty() && wdir.back() == L'\0') wdir.pop_back();
+        }
+    }
+
     STARTUPINFOW si = {0};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {0};
 
-    if (CreateProcessW(NULL, &wcmd[0], NULL, NULL, 0, 0, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(NULL, &wcmd[0], NULL, NULL, 0, 0, NULL,
+                       wdir.empty() ? NULL : wdir.c_str(), &si, &pi)) {
         WaitForSingleObject(pi.hProcess, (unsigned long)-1);
         unsigned long exitCode = 0;
         GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -269,7 +281,11 @@ static int run_process(const std::string& cmd) {
     }
     return -1;
 #else
-    return std::system(cmd.c_str());
+    std::string full = cmd;
+    if (!workingDir.empty()) {
+        full = "cd \"" + workingDir.u8string() + "\" && " + cmd;
+    }
+    return std::system(full.c_str());
 #endif
 }
 
@@ -934,7 +950,7 @@ static int cmdRun(const std::string& fileStr, bool verbose, bool window, bool gu
     }
 
     std::string runCmd = "\"" + outExe.u8string() + "\"";
-    int ret = run_process(runCmd);
+    int ret = run_process(runCmd, includeDir);
 
     if (verbose){
         std::cout << "\nProcess exited with code " << ret << std::endl;

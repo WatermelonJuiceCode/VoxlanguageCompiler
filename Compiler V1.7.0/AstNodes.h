@@ -346,14 +346,15 @@ class VariableNode : public AstNode{
 public:
     std::string name;
     int line = 0;
+    int col = 0;
     bool needsDeref = false;
     bool forceNoDeref = false;
     bool isOptionalLoopVar = false;
     bool isGlobal = false;              // ★ 是否引用全局变量
     bool isHeapCaptured = false;     // ★ 是否被 ref lambda 捕获（已堆提升）
 
-    explicit VariableNode(std::string argName, int srcLine = 0)
-        : name(std::move(argName)), line(srcLine) {}
+    explicit VariableNode(std::string argName, int srcLine = 0, int srcCol = 0)
+        : name(std::move(argName)), line(srcLine), col(srcCol) {}
 
     std::string toString() const override { return name; }
     std::string toC() const override {
@@ -522,9 +523,10 @@ public:
     AstNodePtr object;
     AstNodePtr index;
     int line = 0;
+    int col = 0;
 
-    IndexNode(AstNodePtr o, AstNodePtr i, int srcLine = 0)
-        : object(std::move(o)), index(std::move(i)), line(srcLine) {}
+    IndexNode(AstNodePtr o, AstNodePtr i, int srcLine = 0, int srcCol = 0)
+        : object(std::move(o)), index(std::move(i)), line(srcLine), col(srcCol) {}
 
     std::string toString() const override {
         return object->toString() + "[" + index->toString() + "]";
@@ -936,6 +938,14 @@ public:
             return "vox::String(" + expr->toC() + ", " + extraArg->toC() + ")";
         }
 
+        // ★ 可空类型：用直接构造 std::optional，避免 static_cast 碰到 {} 语法错误
+        if (!targetType.empty() && targetType.back() == '?') {
+            if (std::dynamic_pointer_cast<NullNode>(expr)) {
+                return mapTypeToC(targetType) + "{}";  // 例如 std::optional<int>{}
+            }
+            return mapTypeToC(targetType) + "(" + expr->toC() + ")";
+        }
+
         if (targetType == "string") return "vox::vox_str(" + expr->toC() + ")";
         if (targetType == "int")    return "vox::vox_cast_int(" + expr->toC() + ")";
         if (targetType == "int64")  return "vox::vox_cast_int64(" + expr->toC() + ")";
@@ -1027,6 +1037,9 @@ class BinaryNode : public AstNode {
         return "(" + left->toString() + " " + tokenTypeName(op) + " " + right->toString() + ")";
     }
     std::string toC() const override {
+        if (op == TokenType::KwIn) {
+            return "vox::vox_in(" + left->toC() + ", " + right->toC() + ")";
+        }
         // ★ == null 特判
         if (op == TokenType::EqualEqual && std::dynamic_pointer_cast<NullNode>(right)) {
             return "vox::vox_is_null(" + left->toC() + ")";
@@ -1978,13 +1991,39 @@ public:
             + " = __vox_it_0._current_();\n";
             r += "        __vox_it_0._next_();\n";
         } else {
-            // 多变量：也恢复成 std::optional<T> 的原始逻辑
+            // 多变量：如果没有写 ?，生成基础类型；如果写了 ?，生成 optional
             for (std::size_t i = 0; i < n; ++i) {
                 std::string idx = std::to_string(i);
                 std::string cType = mapTypeToC(vars[i].type);
-                r += "        std::optional<" + cType + "> " + vars[i].name + ";\n";
+                bool isOpt = (!vars[i].type.empty() && vars[i].type.back() == '?');
+                
+                // ★ 核心修复：没写 ? 就生成基础类型默认值，不套 optional
+                if (isOpt) {
+                    if (cType.find("std::optional<") == 0) {
+                        r += "        " + cType + " " + vars[i].name + ";\n";
+                    } else {
+                        r += "        std::optional<" + cType + "> " + vars[i].name + ";\n";
+                    }
+                } else {
+                    r += "        " + cType + " " + vars[i].name + "{};\n";
+                }
+                
                 r += "        if (!__vox_it_" + idx + "._done_()) {\n";
-                r += "            " + vars[i].name + " = __vox_it_" + idx + "._current_();\n";
+                
+                std::string currentVal = "__vox_it_" + idx + "._current_()";
+                std::string baseType = vars[i].type;
+                if (!baseType.empty() && baseType.back() == '?') baseType.pop_back();
+                
+                if (baseType == "int" || baseType == "int8" || baseType == "int16" || baseType == "int32" || baseType == "int64" || baseType == "uint8" || baseType == "uint16" || baseType == "uint32" || baseType == "uint64" || baseType == "byte") {
+                    r += "            " + vars[i].name + " = vox::vox_cast_int(" + currentVal + ");\n";
+                } else if (baseType == "string") {
+                    r += "            " + vars[i].name + " = vox::vox_str(" + currentVal + ");\n";
+                } else if (baseType == "bool") {
+                    r += "            " + vars[i].name + " = vox::vox_cast_bool(" + currentVal + ");\n";
+                } else {
+                    r += "            " + vars[i].name + " = " + currentVal + ";\n";
+                }
+                
                 r += "            __vox_it_" + idx + "._next_();\n";
                 r += "        }\n";
             }
@@ -2092,7 +2131,7 @@ public:
         }
         localsArg += "}";
 
-        return "throw vox::" + exceptionName + "(\""
+        return "throw " + exceptionName + "(\""
             + escapeCString(exceptionName) + "\", "
             + msgArg + ", "
             + "\"" + escapeCString(path)    + "\", "
@@ -2913,7 +2952,32 @@ public:
                     r += "        if (" + bases[i] + "::vox_is_type(t)) return true;\n";
                 }
             }
-            r += "        return false;\n    }\n};\n";
+            r += "        return false;\n    }\n";
+
+            // ★★★ 如果是自定义异常类，强行补全所有构造函数 ★★★
+            bool isExceptionClass = false;
+            for (const auto& b : bases){
+                if (b == "Exception" || b == "vox::Exception") {
+                    isExceptionClass = true;
+                    break;
+                }
+            }
+            
+            if (isExceptionClass) {
+                r += "public:\n";
+                r += "    " + name + "() : vox::Exception() {}\n";
+                r += "    " + name + "(vox::NoInit) : vox::Exception(vox::NoInit()) {}\n";
+                r += "    " + name + "(std::string t, std::string m) : vox::Exception(std::move(t), std::move(m)) {}\n";
+                r += "    " + name + "(std::string t, std::string m, std::string p, std::string c, int l) : vox::Exception(std::move(t), std::move(m), std::move(p), std::move(c), l) {}\n";
+                // ★ 给 raise 使用的 11 参数构造
+                r += "    " + name + "(std::string t, std::string m, std::string p, std::string sl, int l, int c1, int l1, int c2, int l2, std::map<std::string, std::string> loc, std::string fn) : vox::Exception(std::move(t), std::move(m), std::move(p), std::move(sl), l, c1, l1, c2, l2, std::move(loc), std::move(fn)) {}\n\n";
+                
+                // 顺便覆盖基类的类型检查
+                r += "    virtual bool vox_is_type(const std::string& t) const { return t == \"" + name + "\" || vox::Exception::vox_is_type(t); }\n\n";
+            }
+
+            r += "};";
+            
             return r;
         }
 
@@ -2997,8 +3061,8 @@ public:
             for (const auto& f : fields){
                 if (f.isStatic) continue;
                 r += "        this->" + f.name + " = std::move(other." + f.name + ");\n";
-                // ★★★ 核心：强制将源对象置空 ★★★
-                r += "        other." + f.name + " = -1;\n"; 
+                // ★★★ 用 decltype 默认构造，避免对 List 等非 int 类型赋 -1 ★★★
+                r += "        other." + f.name + " = decltype(other." + f.name + "){};\n"; 
             }
             for (const auto& s : signals){
                 r += "        this->" + s.name + " = std::move(other." + s.name + ");\n";
@@ -3611,6 +3675,33 @@ public:
             r += "    friend " + fd + ";\n";
         }
 
+        // ★ 生成字段约束 helper
+        if (anyFieldConstraint){
+            r += "private:\n";
+            r += "    void _vox_check_fields_() {\n";
+            for (const auto& f : fields){
+                if (f.constraint.has_value()){
+                    r += "        " + f.constraint->toCCheck(f.name) + "\n";
+                }
+            }
+            r += "    }\n";
+        }
+
+        // ★★★ 检查是否是自定义异常类 ★★★
+        bool isExceptionClass = false;
+        for (const auto& b : bases){
+            if (b == "Exception" || b == "vox::Exception") {
+                isExceptionClass = true;
+                break;
+            }
+        }
+        
+        if (isExceptionClass) {
+            // 如果继承自 Exception，补全 raise 需要的 11 参数构造
+            r += "public:\n";
+            r += "    " + name + "(std::string t, std::string m, std::string p, std::string sl, int l, int c1, int l1, int c2, int l2, std::map<std::string, std::string> loc, std::string fn) : vox::Exception(std::move(t), std::move(m), std::move(p), std::move(sl), l, c1, l1, c2, l2, std::move(loc), std::move(fn)) {}\n\n";
+        }
+
         r += "};";
 
         // ========== 自由函数：运算符重载（必须在 class 外部！） ==========
@@ -3782,31 +3873,20 @@ public:
         }
 
         // ---- 用户自定义异常 ----
-        std::vector<std::string> userExceptions;
-        for (const auto& s : statements){
-            if (auto c = std::dynamic_pointer_cast<ClassNode>(s)){
+        for (const auto& stmt : statements){
+            if (auto c = std::dynamic_pointer_cast<ClassNode>(stmt)){
+                bool isExc = false;
                 for (const auto& b : c->bases){
-                    if (b == "Exception"){
-                        userExceptions.push_back(c->name);
+                    if (b == "Exception" || b == "vox::Exception") {
+                        isExc = true; 
                         break;
                     }
                 }
+                if (isExc) {
+                    // ★ 直接在全局生成自定义异常，并将基类指定为 vox::Exception
+                    result += c->toC() + "\n";
+                }
             }
-        }
-        if (!userExceptions.empty()){
-            result += "namespace vox {\n";
-            result += "#define VOX_DEFINE_EXCEPTION(name) \\\n";
-            result += "    class name : public Exception { \\\n";
-            result += "    public: \\\n";
-            result += "        name() : Exception() {} \\\n";
-            result += "        name(std::string t, std::string m) : Exception(std::move(t), std::move(m)) {} \\\n";
-            result += "        name(std::string t, std::string m, std::string p, std::string c, int l) \\\n";
-            result += "            : Exception(std::move(t), std::move(m), std::move(p), std::move(c), l) {} \\\n";
-            result += "        name(std::string t, std::string m, std::string p, std::string sl, \\\n";
-            result += "             int l, int c1, int l1, int c2, int l2) \\\n";
-            result += "            : Exception(std::move(t), std::move(m), std::move(p), std::move(sl), \\\n";
-            result += "                        l, c1, l1, c2, l2) {} \\\n";
-            result += "    };\n\n";
         }
 
         // ---- 先输出顶层 ExternBlockNode ----
@@ -3934,8 +4014,30 @@ public:
                 }
             }
         }
-        
-        // ★ 全局变量 extern 声明 —— 放到 class 前，让类方法能引用
+
+        // ---- 输出 namespace / class / enum（跳过全局变量和函数） ----
+        for (const auto& stmt : statements){
+            if (stmt->isTopLevelDefinition()){
+                if (auto var = std::dynamic_pointer_cast<VariableDeclNode>(stmt)){
+                    if (var->isGlobal) continue;
+                }
+                if (std::dynamic_pointer_cast<FunctionDeclNode>(stmt)) continue;
+
+                // ★ 必须加这个判断，否则会报类重定义
+                if (auto cls = std::dynamic_pointer_cast<ClassNode>(stmt)) {
+                    bool isExc = false;
+                    for (const auto& b : cls->bases) {
+                        if (b == "Exception" || b == "vox::Exception") { isExc = true; break; }
+                    }
+                    if (isExc) continue;
+                }
+
+                result += stmt->toC();
+                result += "\n\n";
+            }
+        }
+
+        // ★ 全局变量 extern 声明 —— 挪到 class 定义之后，避免 incomplete type
         for (const auto& stmt : statements){
             if (auto var = std::dynamic_pointer_cast<VariableDeclNode>(stmt)){
                 if (var->isGlobal){
@@ -3957,18 +4059,6 @@ public:
             }
         }
         result += "\n";
-
-        // ---- 输出 namespace / class / enum（跳过全局变量和函数） ----
-        for (const auto& stmt : statements){
-            if (stmt->isTopLevelDefinition()){
-                if (auto var = std::dynamic_pointer_cast<VariableDeclNode>(stmt)){
-                    if (var->isGlobal) continue;
-                }
-                if (std::dynamic_pointer_cast<FunctionDeclNode>(stmt)) continue;
-                result += stmt->toC();
-                result += "\n\n";
-            }
-        }
 
         // ---- ★ 收集所有顶层枚举名（用于全局变量声明判断） ----
         std::set<std::string> enumNames;
