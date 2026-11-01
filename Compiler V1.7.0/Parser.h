@@ -4395,18 +4395,24 @@ private:
         }
 
         if (token.type == TokenType::LParen){
-            // ★ 改进：支持 (int?) / (List<int>?) 等可空类型转换
+            // ★ 支持 (int?) / (List<int>?) 等可空类型转换
             std::size_t save = _pos;
             advance(); // (
             bool isCast = false;
             std::string targetType;
             if (isTypeKeyword(current().type) || isContainerStart(current().type) || check(TokenType::Identifier)) {
                 std::size_t typeSave = _pos;
-                targetType = parseTypeName();
-                if (check(TokenType::RParen)) {
+                bool ok = true;
+                // ★ 核心修复：捕获类型解析异常，防止误判普通算术表达式（如 g < b）
+                try {
+                    targetType = parseTypeName();
+                } catch (const CompileError&) {
+                    ok = false;
+                }
+                if (ok && check(TokenType::RParen)) {
                     isCast = true;
                 } else {
-                    _pos = typeSave; // 不是类型，回滚
+                    _pos = typeSave; // 回滚
                 }
             }
             if (isCast) {
@@ -8693,8 +8699,9 @@ private:
                     if (it != _classMembers.end() && it->second.count(n->member) == 0){
                         raise(EX_NAME, "class '" + cls + "' has no member named '" + n->member + "'", n->line);
                     }
-                    // ★ 新增：普通代码访问 private 检查（append 上下文已经单独检查过了）
-                    if (!_inAppendContext){
+                    // ★ 普通代码访问 private 检查（append 上下文已经单独检查过了）
+                    // ★ 如果当前方法就属于这个类，允许访问同类实例的私有成员
+                    if (!_inAppendContext && cls != _currentClassName){
                         auto pit = _classPublicMembers.find(cls);
                         if (pit != _classPublicMembers.end() && pit->second.count(n->member) == 0){
                             // 是不是方法？（方法可能不用走这里，因为 asCallee 会传 true）
@@ -8955,6 +8962,17 @@ private:
             for (std::size_t i = 0; i < n->names.size(); ++i){
                 std::string name = n->names[i];
                 
+                // ★ 核心修复：检查同一作用域内是否重复定义（跳过顶层，因为顶层有专门的预填充和检查）
+                if (_typeScopeStack.size() > 1 && _typeScopeStack.back().count(name) > 0) {
+                    // ★ 精准定位：在源码行里找变量名第一次出现的位置
+                    std::string lineStr = getLine(n->line);
+                    int col = (int)lineStr.find(name);
+                    if (col < 0) col = 0;
+                    throw CompileError(EX_NAME, 
+                        "variable '" + name + "' is already declared in this scope", 
+                        _fileName, lineStr, n->line, col, (int)name.size(), "duplicate declaration");
+                }
+
                 // 1. 先注册到当前作用域（这样后面的变量就能引用它了）
                 _typeScopeStack.back()[name] = n->typeName;
                 if (n->isConst){
