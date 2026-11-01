@@ -1025,13 +1025,14 @@ class BinaryNode : public AstNode {
     TokenType op;
     AstNodePtr right;
     int line = 0;
+    int col = 0;  // ★ 新增：记录操作符列号
     bool useAnyOps = false;   // ★ 任一侧是 any → 走 vox_any_* 函数
     bool isStringConcat = false;   // ★ Parser 语义分析阶段设置
     
     BinaryNode(AstNodePtr argLeft, TokenType argOp, AstNodePtr argRight,
-               int srcLine = 0)
+               int srcLine = 0, int srcCol = 0)
         : left(std::move(argLeft)), op(argOp), right(std::move(argRight)),
-        line(srcLine) {}
+        line(srcLine), col(srcCol) {}
         
     std::string toString() const override {
         return "(" + left->toString() + " " + tokenTypeName(op) + " " + right->toString() + ")";

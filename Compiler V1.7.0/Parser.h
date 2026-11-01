@@ -3508,11 +3508,11 @@ private:
                         std::string typeName = parseTypeName();
                         whenCond = std::make_shared<IsNode>(expr, typeName, current().line);
                         
-                        // 支持 `when int && x == 12`
                         while (check(TokenType::AmpAmp) || check(TokenType::PipePipe)) {
-                            TokenType op = advance().type;
+                            Token opTok = current();
+                            advance();
                             AstNodePtr right = parseExpression();
-                            whenCond = std::make_shared<BinaryNode>(whenCond, op, right, current().line);
+                            whenCond = std::make_shared<BinaryNode>(whenCond, opTok.type, right, opTok.line, opTok.col);
                         }
                     } else {
                         whenCond = parseExpression();
@@ -3542,9 +3542,10 @@ private:
                         std::string typeName = parseTypeName();
                         whenCond = std::make_shared<IsNode>(expr, typeName, current().line);
                         while (check(TokenType::AmpAmp) || check(TokenType::PipePipe)) {
-                            TokenType op = advance().type;
+                            Token opTok = current();
+                            advance();
                             AstNodePtr right = parseExpression();
-                            whenCond = std::make_shared<BinaryNode>(whenCond, op, right, current().line);
+                            whenCond = std::make_shared<BinaryNode>(whenCond, opTok.type, right, opTok.line, opTok.col);
                         }
                     } else {
                         whenCond = parseExpression();
@@ -3670,10 +3671,10 @@ private:
     AstNodePtr parsePipePipe(){
         AstNodePtr left = parseAmpAmp();
         while (check(TokenType::PipePipe)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseAmpAmp();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3681,10 +3682,10 @@ private:
     AstNodePtr parseAmpAmp(){
         AstNodePtr left = parsePipe();
         while (check(TokenType::AmpAmp)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parsePipe();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3692,10 +3693,10 @@ private:
     AstNodePtr parsePipe(){
         AstNodePtr left = parseCaret();
         while (check(TokenType::Pipe)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseCaret();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3703,10 +3704,10 @@ private:
     AstNodePtr parseCaret(){
         AstNodePtr left = parseAmp();
         while (check(TokenType::Caret)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseAmp();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3714,10 +3715,10 @@ private:
     AstNodePtr parseAmp(){
         AstNodePtr left = parseComparison();
         while (check(TokenType::Amp)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseComparison();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3728,20 +3729,20 @@ private:
                check(TokenType::LessEqual) || check(TokenType::GreaterEqual) ||
                check(TokenType::EqualEqual) || check(TokenType::NotEqual) ||
                check(TokenType::KwIs) || check(TokenType::KwIn)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
 
-            if (op == TokenType::KwIs){
+            if (opTok.type == TokenType::KwIs){
                 if (check(TokenType::Null)){
                     advance();
                     left = std::make_shared<IsNullNode>(left);
                 } else {
                     std::string typeName = parseTypeName();
-                    left = std::make_shared<IsNode>(left, typeName, opLine);
+                    left = std::make_shared<IsNode>(left, typeName, opTok.line);
                 }
             } else {
                 AstNodePtr right = parseShift();
-                left = std::make_shared<BinaryNode>(left, op, right, opLine);
+                left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
             }
         }
         return left;
@@ -3813,10 +3814,10 @@ private:
     AstNodePtr parseShift(){
         AstNodePtr left = parseAdditive();
         while (check(TokenType::Shl) || check(TokenType::Shr)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseAdditive();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3824,10 +3825,10 @@ private:
     AstNodePtr parseAdditive(){
         AstNodePtr left = parseMultiplicative();
         while (check(TokenType::Plus) || check(TokenType::Sub)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();        // ★ 改为捕获完整 Token
+            advance();
             AstNodePtr right = parseMultiplicative();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -3835,10 +3836,10 @@ private:
     AstNodePtr parseMultiplicative(){
         AstNodePtr left = parseUnary();
         while (check(TokenType::Mul) || check(TokenType::Div) || check(TokenType::Mod)){
-            int opLine = current().line;
-            TokenType op = advance().type;
+            Token opTok = current();
+            advance();
             AstNodePtr right = parseUnary();
-            left = std::make_shared<BinaryNode>(left, op, right, opLine);
+            left = std::make_shared<BinaryNode>(left, opTok.type, right, opTok.line, opTok.col);
         }
         return left;
     }
@@ -4491,7 +4492,7 @@ private:
         // x--
         if (match(TokenType::SubSub)){
             AstNodePtr sum = std::make_shared<BinaryNode>(expr, TokenType::Sub,
-                std::make_shared<NumberNode>(1), srcLine);
+                std::make_shared<NumberNode>(1), srcLine, _lastToken.col);
             if (auto v = std::dynamic_pointer_cast<VariableNode>(expr)){
                 return std::make_shared<AssignmentNode>(v->name, sum, srcLine);
             }
@@ -8464,6 +8465,12 @@ private:
             std::string lt = inferExprType(n->left);
             std::string rt = inferExprType(n->right);
 
+            // ★ 剥离可空后缀，获取基础类型
+            std::string baseLt = lt;
+            if (!baseLt.empty() && baseLt.back() == '?') baseLt.pop_back();
+            std::string baseRt = rt;
+            if (!baseRt.empty() && baseRt.back() == '?') baseRt.pop_back();
+
             // ★★★ 核心修复：参与二元运算的 optional 变量必须解包，否则 C++ 编译报错 ★★★
             if (!lt.empty() && lt.back() == '?' && n->op != TokenType::EqualEqual && n->op != TokenType::NotEqual) {
                 if (auto v = std::dynamic_pointer_cast<VariableNode>(n->left)) {
@@ -8477,10 +8484,34 @@ private:
                     v->forceNoDeref = false;
                 }
             }
-            
-            // ★ 确保这里有 isStringConcat 的判断
+
+            // ★★★ 严格类型检查：string 和数字不能隐式相加 ★★★
+            if (n->op == TokenType::Plus) {
+                bool lStr = (baseLt == "string");
+                bool rStr = (baseRt == "string");
+                bool lNum = isNumericType(baseLt);
+                bool rNum = isNumericType(baseRt);
+
+                if (lStr && rNum) {
+                    // 除非右边是显式的 (string) 转换
+                    auto cast = std::dynamic_pointer_cast<CastNode>(n->right);
+                    if (!cast || cast->targetType != "string") {
+                        // ★ 精准定位到 '+' 号
+                        raise(EX_TYPE, "cannot add 'string' and '" + baseRt + "' directly. Use '(string)' to cast the number to string first.", 
+                              n->line, n->col, "type mismatch");
+                    }
+                } else if (rStr && lNum) {
+                    auto cast = std::dynamic_pointer_cast<CastNode>(n->left);
+                    if (!cast || cast->targetType != "string") {
+                        raise(EX_TYPE, "cannot add '" + baseLt + "' and 'string' directly. Use '(string)' to cast the number to string first.", 
+                              n->line, n->col, "type mismatch");
+                    }
+                }
+            }
+
+            // ★ 确保这里有 isStringConcat 的判断（只要有一边是 string 或 string? 就作为拼接处理）
             if (n->op == TokenType::Plus){
-                if (lt == "string" || rt == "string"){
+                if (baseLt == "string" || baseRt == "string"){
                     n->isStringConcat = true;
                 }
             }
